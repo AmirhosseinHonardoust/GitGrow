@@ -1,53 +1,94 @@
 #!/usr/bin/env python3
+# scripts/autostargrow.py
 
 import os
 import sys
 import json
 import random
 from pathlib import Path
-from github import Github
 from datetime import datetime, timezone
 
-BOT_USER = os.getenv("BOT_USER")
-TOKEN = os.getenv("PAT_TOKEN")
-STATE_PATH = Path(".github/state/stargazer_state.json")
-USERNAMES_PATH = Path("config/usernames.txt")
-GROWTH_SAMPLE = 10  # Number of new growth users to process per run
+from github import Github, Auth, GithubException
+
+# --- Config ---
+GROWTH_SAMPLE = 10  # how many new users to process per run
+
+# Resolve repo root regardless of where the script is invoked from
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STATE_PATH = REPO_ROOT / ".github" / "state" / "stargazer_state.json"
+USERNAMES_PATH = REPO_ROOT / "config" / "usernames.txt"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_or_init_state(path: Path) -> dict:
+    """Load JSON state; if missing, initialize it to an empty dict."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        print(f"[INIT] {path} not found. Creating empty state {{}}")
+        path.write_text("{}\n", encoding="utf-8")
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"[WARN] {path} is corrupt JSON. Re-initializing to {{}}")
+        path.write_text("{}\n", encoding="utf-8")
+        return {}
+
+
+def pick_public_nonfork_repos(user, max_repos: int = 3):
+    """Return up to max_repos public, non-fork, non-private repos for a user."""
+    repos = []
+    try:
+        for repo in user.get_repos():
+            if repo.private or repo.fork:
+                continue
+            repos.append(repo)
+            if len(repos) >= max_repos:
+                break
+    except GithubException as e:
+        print(f"    [WARN] Unable to list repos for {user.login}: {e}")
+    return repos
+
 
 def main():
     print("=== GitGrowBot autostargrow.py started ===")
 
-    if not TOKEN or not BOT_USER:
-        print("ERROR: PAT_TOKEN and BOT_USER required", file=sys.stderr)
-        sys.exit(1)
-    print(f"PAT_TOKEN and BOT_USER env vars present.")
-    print(f"BOT_USER: {BOT_USER}")
+    # --- Env & Auth ---
+    bot_user = os.getenv("BOT_USER")
+    raw_token = os.getenv("PAT_TOKEN")
+
+    if not bot_user or not raw_token:
+        die("PAT_TOKEN and BOT_USER required")
+
+    token = raw_token.strip()
+    if not token:
+        die("PAT_TOKEN is empty after stripping")
+
+    print("PAT_TOKEN and BOT_USER env vars present.")
+    print(f"BOT_USER: {bot_user}")
 
     if not USERNAMES_PATH.exists():
-        print(f"ERROR: {USERNAMES_PATH} not found; cannot perform growth starring.", file=sys.stderr)
-        sys.exit(1)
+        die(f"{USERNAMES_PATH} not found; cannot perform growth starring.")
 
     print("Authenticating with GitHub...")
-    gh = Github(TOKEN)
     try:
+        gh = Github(auth=Auth.Token(token))  # modern (no deprecation warning)
         me = gh.get_user()
         print(f"Authenticated as: {me.login}")
     except Exception as e:
-        print("ERROR: Could not authenticate with GitHub:", e)
-        sys.exit(1)
+        die(f"Could not authenticate with GitHub: {e}")
 
-    # *** ONLY THIS BLOCK IS MODIFIED ***
-    if not STATE_PATH.exists():
-        print(f"ERROR: State file {STATE_PATH} not found. Did you forget to fetch tracker-data branch?", file=sys.stderr)
-        sys.exit(1)
-
+    # --- State ---
     print(f"Loading state from {STATE_PATH} ...")
-    with open(STATE_PATH) as f:
-        state = json.load(f)
+    state = load_or_init_state(STATE_PATH)
     growth_starred = state.get("growth_starred", {})
-    # *** END OF MODIFICATION ***
 
-    # Upgrade legacy entries to always use dict with 'repo' and 'starred_at'
+    # Upgrade legacy entries (string -> dict form)
     changed = False
     for user, entries in list(growth_starred.items()):
         upgraded = []
@@ -57,59 +98,60 @@ def main():
             elif isinstance(e, str):
                 upgraded.append({"repo": e, "starred_at": None})
                 changed = True
-            else:
-                # Any other legacy or corrupt entry
-                continue
+            # else: skip corrupt entries silently
         if upgraded != entries:
             growth_starred[user] = upgraded
             changed = True
 
-    # Load candidate usernames for growth
-    with open(USERNAMES_PATH) as f:
+    # --- Load candidate usernames ---
+    with USERNAMES_PATH.open("r", encoding="utf-8") as f:
         all_usernames = [line.strip() for line in f if line.strip()]
     print(f"  Loaded {len(all_usernames)} usernames from {USERNAMES_PATH}")
 
-    # Exclude already starred users
-    available = set(all_usernames) - set(growth_starred)
+    # Exclude already processed users
+    available = list(set(all_usernames) - set(growth_starred))
     print(f"  {len(available)} candidates for growth starring.")
-    sample = random.sample(list(available), min(GROWTH_SAMPLE, len(available)))
+    if not available:
+        print("  No new candidates; nothing to do.")
+    sample = random.sample(available, min(GROWTH_SAMPLE, len(available))) if available else []
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    for i, user in enumerate(sample):
-        print(f"  [{i+1}/{len(sample)}] Growth star for user: {user}")
+    # --- Star a repo for each sampled user ---
+    for i, login in enumerate(sample, start=1):
+        print(f"  [{i}/{len(sample)}] Growth star for user: {login}")
         try:
-            u = gh.get_user(user)
-            repos = []
-            for repo in u.get_repos():
-                if not repo.fork and not repo.private:
-                    repos.append(repo)
-                if len(repos) >= 3:
-                    break
-            if not repos:
-                print(f"    No public repos to star for {user}, skipping.")
-                continue
-            repo = random.choice(repos)
+            u = gh.get_user(login)
+        except GithubException as e:
+            print(f"    [SKIP] Cannot fetch user {login}: {e}")
+            continue
+
+        repos = pick_public_nonfork_repos(u, max_repos=3)
+        if not repos:
+            print(f"    No public repos to star for {login}, skipping.")
+            continue
+
+        repo = random.choice(repos)
+        try:
             print(f"    Starring repo: {repo.full_name}")
             me.add_to_starred(repo)
-            growth_starred.setdefault(user, [])
-            growth_starred[user].append({
-                "repo": repo.full_name,
-                "starred_at": now_iso
-            })
+            growth_starred.setdefault(login, [])
+            growth_starred[login].append({"repo": repo.full_name, "starred_at": now_iso})
             changed = True
-            print(f"    Growth: Starred {repo.full_name} for {user} at {now_iso}")
-        except Exception as e:
-            print(f"    Failed to star for growth {user}: {e}")
+            print(f"    Growth: Starred {repo.full_name} for {login} at {now_iso}")
+        except GithubException as e:
+            # 304 (not modified) may mean already starred; 403 may be perms
+            print(f"    Failed to star {repo.full_name} for {login}: {e}")
 
-    # Save updated growth_starred to state file
+    # --- Persist state if changed (or always write to keep deterministic) ---
     print(f"Saving updated growth_starred to {STATE_PATH} ...")
     state["growth_starred"] = growth_starred
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
+    with STATE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
     print(f"Updated growth_starred written to {STATE_PATH}")
 
     print("=== GitGrowBot autostargrow.py finished ===")
+
 
 if __name__ == "__main__":
     main()
