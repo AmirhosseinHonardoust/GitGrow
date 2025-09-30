@@ -3,8 +3,8 @@ import os
 import sys
 import random
 from pathlib import Path
-from github import Github, GithubException, Auth
 from datetime import datetime, timedelta, timezone
+from github import Github, GithubException, Auth
 
 def die(msg: str):
     print(msg, file=sys.stderr)
@@ -15,10 +15,15 @@ def main():
     raw = os.getenv("PAT_TOKEN")
     if not raw:
         die("PAT_TOKEN environment variable is required")
-    token = raw.strip()  # <-- removes trailing \n / spaces
+    token = raw.strip()                   # <-- remove trailing \n / spaces
     if not token:
         die("PAT_TOKEN is empty after stripping")
 
+    gh = Github(auth=Auth.Token(token))   # <-- modern auth (no deprecation warning)
+    try:
+        me = gh.get_user()
+    except GithubException as e:
+        die(f"[ERROR] auth/user lookup failed: {e}")
     # Use modern auth; avoids the deprecation warning
     gh = Github(auth=Auth.Token(token))
     try:
